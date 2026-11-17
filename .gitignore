@@ -3,3 +3,7 @@
 /urls.txt
 /substacks
 /combined.csv
+/.venv
+*.code-workspace
+__pycache__/
+.pytest_cache/

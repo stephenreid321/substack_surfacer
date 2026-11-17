@@ -22,8 +22,13 @@ Announcement post: https://stephenreid.substack.com/p/substack-surfacer-counteri
 1. **Clone or download** this repository
 2. **Install required dependencies**:
    ```bash
-   pip install requests tqdm
-   pip install git+https://github.com/NHagar/substack_api
+   python3 -m venv .venv
+   .venv/bin/pip install -r requirements.txt
+   ```
+3. **Run the tests** (optional, offline):
+   ```bash
+   .venv/bin/pip install -r requirements-dev.txt
+   .venv/bin/python -m pytest
    ```
 
 ## Usage 📋

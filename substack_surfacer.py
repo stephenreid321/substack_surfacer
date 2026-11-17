@@ -31,48 +31,111 @@ import re
 import requests
 import sys
 import json
+import io
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
-from tqdm import tqdm
 from typing import List, Dict, Optional, Callable, Any
-from substack_api import Newsletter, Post
 
 # Configuration constants
 DEFAULT_MAX_RETRIES = 8
 MAX_BACKOFF_WAIT_TIME = 60  # seconds
 REQUEST_TIMEOUT = 10  # seconds
+DEFAULT_WORKERS = 12  # 24 was no faster; 48 hit Substack rate limits
+
+_thread_local = threading.local()
 
 
-def retry_with_backoff(func: Callable[[], Any], max_retries: int = DEFAULT_MAX_RETRIES, 
+def http_get(url: str, **kwargs) -> requests.Response:
+    """GET using a per-thread requests.Session so connections are reused."""
+    session = getattr(_thread_local, 'session', None)
+    if session is None:
+        session = _thread_local.session = requests.Session()
+    kwargs.setdefault('timeout', REQUEST_TIMEOUT)
+    return session.get(url, **kwargs)
+
+
+class ThreadBufferedStdout(io.TextIOBase):
+    """Buffers output per worker thread so each newsletter's log prints as one block."""
+
+    def __init__(self, real):
+        self.real = real
+        self.lock = threading.Lock()
+
+    def write(self, text):
+        buf = getattr(_thread_local, 'log_buffer', None)
+        if buf is not None:
+            buf.append(text)
+        else:
+            with self.lock:
+                self.real.write(text)
+                self.real.flush()
+        return len(text)
+
+    def flush(self):
+        self.real.flush()
+
+    def start_buffer(self):
+        _thread_local.log_buffer = []
+
+    def end_buffer(self):
+        text = ''.join(getattr(_thread_local, 'log_buffer', None) or [])
+        _thread_local.log_buffer = None
+        with self.lock:
+            self.real.write(text)
+            self.real.flush()
+
+
+TRANSIENT_MAX_RETRIES = 3  # for timeouts, connection errors and 5xx responses
+
+
+def retry_with_backoff(func: Callable[[], Any], max_retries: int = DEFAULT_MAX_RETRIES,
                       operation_name: str = "operation") -> Any:
-    """Execute a function with exponential backoff retry logic for rate limiting."""
+    """Run func, retrying on rate limits (429), 5xx responses, timeouts and connection errors.
+
+    Returns func's result, or an error string ('Rate limited' / 'Error: ...') if it gives up.
+    """
+    transient_failures = 0
     for attempt in range(max_retries):
         try:
             return func()
-        except Exception as e:
-            error_str = str(e).lower()
-            
-            # Check if it's a rate limiting error (429)
-            if '429' in error_str or 'rate limit' in error_str or 'too many requests' in error_str:
-                if attempt < max_retries - 1:
-                    # Exponential backoff with cap: 1s, 2s, 4s, 8s, 16s (max 60s)
-                    wait_time = min(2 ** attempt, MAX_BACKOFF_WAIT_TIME)
-                    print(f"⏳ Rate limited for {operation_name}, waiting {wait_time}s (attempt {attempt + 1}/{max_retries})")
-                    time.sleep(wait_time)
-                    continue
-                else:
+        except requests.HTTPError as e:
+            response = e.response
+            status = response.status_code if response is not None else None
+            if status == 429:
+                if attempt == max_retries - 1:
                     return 'Rate limited'
-            else:
-                # For other errors, don't retry
-                return f'Error: {str(e)}'
-    
+                retry_after = response.headers.get('Retry-After', '')
+                wait_time = int(retry_after) if retry_after.isdigit() else 2 ** attempt
+                wait_time = min(wait_time, MAX_BACKOFF_WAIT_TIME)
+                print(f"⏳ Rate limited for {operation_name}, waiting {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                time.sleep(wait_time)
+                continue
+            if status is not None and status >= 500:
+                transient_failures += 1
+                if transient_failures < TRANSIENT_MAX_RETRIES:
+                    print(f"🔁 HTTP {status} for {operation_name}, retrying in {2 ** transient_failures}s")
+                    time.sleep(2 ** transient_failures)
+                    continue
+            return f'Error: {e}'
+        except (requests.Timeout, requests.ConnectionError) as e:
+            transient_failures += 1
+            if transient_failures < TRANSIENT_MAX_RETRIES:
+                print(f"🔁 {type(e).__name__} for {operation_name}, retrying in {2 ** transient_failures}s")
+                time.sleep(2 ** transient_failures)
+                continue
+            return f'Error: {e}'
+        except Exception as e:
+            return f'Error: {e}'
+
     return 'Failed after retries'
 
 def ensure_directory(file_path: str):
     """Create directory for file path if it doesn't exist."""
     output_dir = os.path.dirname(file_path)
     if output_dir and not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
         
 def parse_datetime(date_str: str, raise_on_error: bool = False) -> Optional[datetime]:
     """
@@ -116,14 +179,6 @@ def parse_datetime(date_str: str, raise_on_error: bool = False) -> Optional[date
     if raise_on_error:
         raise ValueError(f"Unable to parse date: {date_str}")
     return None
-
-def calculate_default_max_posts(from_date: datetime, to_date: datetime) -> int:
-    """Calculate default max posts based on days since the from date (1 post per day)."""
-    now = datetime.now(timezone.utc)
-    days_since = (now - from_date).days
-    # Ensure at least 1 day and cap at a reasonable maximum
-    return max(1, min(days_since, 365))  # Between 1 and 365 days
-
 
 def load_urls_from_file(file_path: str) -> List[Dict[str, str]]:
     """Load Substack URLs from a text file. Supports both single URLs and tab-separated URL+category format."""
@@ -192,110 +247,94 @@ def get_free_subscriber_count(publication_url: str, max_retries: int = DEFAULT_M
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
         
-        response = requests.get(publication_url, headers=headers, timeout=REQUEST_TIMEOUT)
+        response = http_get(publication_url, headers=headers)
         response.raise_for_status()
         
         content = response.text
         
         # Look for freeSubscriberCount in the content
-        subscriber_match = re.search(r'\\"freeSubscriberCount\\":\\"([^"]+)\\"', content)
+        subscriber_match = re.search(r'\\?"freeSubscriberCount\\?":\\?"([^"\\]+)', content)
         if subscriber_match:
             return subscriber_match.group(1)
         
         # Fallback to freeSubscriberCountOrderOfMagnitude if freeSubscriberCount not found
-        magnitude_match = re.search(r'\\"freeSubscriberCountOrderOfMagnitude\\":\\"([^"]+)\\"', content)
+        magnitude_match = re.search(r'\\?"freeSubscriberCountOrderOfMagnitude\\?":\\?"([^"\\]+)', content)
         if magnitude_match:
             return magnitude_match.group(1)
         
         return 'UNKNOWN'  # No subscriber count found
     
-    return retry_with_backoff(get_subscriber_count, max_retries, f"subscriber count {publication_url}...")
+    result = retry_with_backoff(get_subscriber_count, max_retries, f"subscriber count {publication_url}")
+    if result.startswith(('Error', 'Rate limited', 'Failed')):
+        print(f"   ⚠️  Could not get subscriber count ({result[:100]}), using UNKNOWN")
+        return 'UNKNOWN'
+    return result
+
+
+ARCHIVE_PAGE_SIZE = 25  # Substack's archive API rejects limits above 25
+
+
+def fetch_archive_posts(newsletter_url: str, from_date: datetime) -> List[Dict]:
+    """Page through a newsletter's archive (newest first) until posts are older than from_date."""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+    archive_url = f"{newsletter_url.rstrip('/')}/api/v1/archive"
+    posts: List[Dict] = []
+    cursor = None
+    while True:
+        params = {'sort': 'new', 'limit': ARCHIVE_PAGE_SIZE}
+        if cursor:
+            params['cursor'] = cursor
+
+        def get_page():
+            response = http_get(archive_url, params=params, headers=headers)
+            response.raise_for_status()
+            return response.json()
+
+        page = retry_with_backoff(get_page, DEFAULT_MAX_RETRIES, "archive page")
+        if not isinstance(page, dict):
+            raise RuntimeError(f"Failed to fetch archive page: {page}")
+
+        page_posts = page.get('posts', [])
+        posts.extend(page_posts)
+        cursor = page.get('nextCursor')
+        if not page_posts or not cursor:
+            break
+        oldest = parse_datetime(page_posts[-1].get('post_date') or '')
+        if oldest and oldest < from_date:
+            break
+    return posts
 
 
 def fetch_newsletter_posts(newsletter_url: str, from_date: datetime, to_date: datetime, max_posts: Optional[int] = None, category: str = '') -> List[Dict]:
-    """Fetch all posts from a newsletter published within the specified time window."""
+    """Fetch posts with from_date <= post_date < to_date (to_date is an exclusive end)."""
     try:
         original_newsletter_url = newsletter_url
         newsletter_url = normalize_substack_url(newsletter_url)
         print(f"📰 Fetching posts from: {newsletter_url}")
         
-        # Initialize newsletter
-        newsletter = Newsletter(newsletter_url)
         
         # Always use URL extraction for newsletter name consistency
         newsletter_name = extract_newsletter_name_from_url(newsletter_url)
         
-        # Get free subscriber count for the newsletter
-        print("   👥 Fetching subscriber count...")
-        free_subscriber_count = get_free_subscriber_count(newsletter_url)
-        print(f"   👥 Free subscribers: {free_subscriber_count}")
-        
-        # Fetch posts - the API doesn't support offset-based pagination
-        # We'll fetch a large batch and filter on our end
         print("   📄 Fetching posts...")
-        
-        # Start with a reasonable limit (API may have its own internal limits)
-        fetch_limit = max_posts if max_posts else 100
-        
-        # Add retry mechanism for getting posts (in case of rate limiting)
-        def get_posts():
-            return newsletter.get_posts(limit=fetch_limit)
-        
-        posts = retry_with_backoff(get_posts, DEFAULT_MAX_RETRIES, "posts")
-        
-        if isinstance(posts, str):  # Error message from retry_with_backoff
-            print(f"   ❌ {posts}")
-            return []
-        
+        posts = fetch_archive_posts(newsletter_url, from_date)
+
         if not posts:
-            print("   ⚠️  No posts found (empty list returned)")
+            print("   ⚠️  No posts found (empty archive)")
             return []
-        
+
         print(f"   📄 Retrieved {len(posts)} posts, filtering by date window...")
         
-        # Make to_date inclusive by adding one day
-        to_date_inclusive = to_date + timedelta(days=1)
-        
         filtered_posts = []
-        for post in tqdm(posts, desc="Filtering posts", unit="post"):
-
-            if 'substack.com/@' in original_newsletter_url:
-                # For @username URLs, we need to follow redirects to get the actual post URL
-                try:
-                    def get_redirected_post_url():
-                        # Get the post's initial URL (this might be in @username format)
-                        post_id = post.url.split('p-')[-1]                        
-                        initial_url = f"https://{original_newsletter_url.split('@')[-1]}.substack.com/p/{post_id}"
-
-                        response = requests.get(initial_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-                        response.raise_for_status()
-                        
-                        return response.url
-                    
-                    redirected_url = retry_with_backoff(get_redirected_post_url, DEFAULT_MAX_RETRIES, "post URL redirect")
-                    
-                    if isinstance(redirected_url, str) and redirected_url.startswith('http'):
-                        # Successfully got redirected URL, create new post object with correct URL
-                        post = Post(redirected_url)
-                    else:
-                        print(f"   ⚠️  Failed to get redirected URL, skipping post")
-                        continue
-                        
-                except Exception as e:
-                    print(f"   ⚠️  Failed to follow redirect for post: {str(e)}")
-                    continue
+        for post in posts:
 
             try:
-                # Retry mechanism with exponential backoff for individual post
-                def get_post_metadata():
-                    return post.get_metadata()
-                
-                post_data = retry_with_backoff(get_post_metadata, DEFAULT_MAX_RETRIES, "post metadata")
-                
-                if isinstance(post_data, str) or not post_data:  # Error or no data
+                post_data = post  # archive entries already carry all the metadata we need
+                if not post_data:
                     continue
                 
-                print(f"🔍 Post metadata: {post_data.get('title', 'UNKNOWN')}")
                 
                 # Parse post date
                 post_date_str = post_data.get('post_date') or post_data.get('created_at')
@@ -309,8 +348,7 @@ def fetch_newsletter_posts(newsletter_url: str, from_date: datetime, to_date: da
                     print(f"   ⚠️  Could not parse date '{post_date_str}' for post: {post_data.get('title', 'UNKNOWN')}")
                     continue
                 
-                # Check if post is within the specified time window (to_date is now inclusive)
-                if from_date <= post_date < to_date_inclusive:
+                if from_date <= post_date < to_date:
                     # Safely extract author name
                     published_bylines = post_data.get('publishedBylines', [])
                     author_name = newsletter_name  # Default fallback
@@ -322,10 +360,10 @@ def fetch_newsletter_posts(newsletter_url: str, from_date: datetime, to_date: da
                         'newsletter_name': newsletter_name,
                         'newsletter_url': newsletter_url,
                         'category': category,
-                        'free_subscriber_count': free_subscriber_count,
+                        'free_subscriber_count': None,  # filled in below, only if there are posts
                         'likes': post_data.get('reaction_count', 'UNKNOWN'),
-                        'likes_per_100_free_subscribers': calculate_engagement_rate(post_data.get('reaction_count', 0), free_subscriber_count),
-                        'post_url': post.url if hasattr(post, 'url') else post_data.get('canonical_url', ''),                        
+                        'likes_per_100_free_subscribers': None,
+                        'post_url': post_data.get('canonical_url', ''),                        
                         'author': author_name,                        
                         'post_title': post_data.get('title', 'No Title'),
                         'post_subtitle': post_data.get('subtitle', ''),                        
@@ -335,10 +373,6 @@ def fetch_newsletter_posts(newsletter_url: str, from_date: datetime, to_date: da
                         'post_id': post_data.get('id', ''),
                     }
                     filtered_posts.append(post_info)
-                    
-                    # Check if we have enough posts
-                    if max_posts and len(filtered_posts) >= max_posts:
-                        break
                 elif post_date < from_date:
                     # Post is older than from_date, stop fetching since posts are chronological
                     print(f"   ⏹️  Reached post older than {from_date.strftime('%Y-%m-%d')} (post date: {post_date.strftime('%Y-%m-%d')}), stopping...")
@@ -348,36 +382,44 @@ def fetch_newsletter_posts(newsletter_url: str, from_date: datetime, to_date: da
                 print(f"⚠️  Unexpected error processing post: {str(e)[:100]}")
                 continue
         
-        if max_posts and len(filtered_posts) < max_posts:
-            print(f"   ℹ️  Only found {len(filtered_posts)} posts in time window {from_date.strftime('%Y-%m-%d')} to {to_date.strftime('%Y-%m-%d')}")
-        
-        # Check if we hit the max_posts limit exactly - this might indicate more posts are available
-        if max_posts and len(filtered_posts) == max_posts:
-            error_msg = f"⚠️  Hit max_posts limit ({max_posts}) - there may be more posts available. Consider increasing --max-posts or narrowing the date range."
-            print(f"   ❌ {error_msg}")
-            raise ValueError(error_msg)
-        
+        # Only fetch the (heavy) homepage for a subscriber count when we have posts to attach it to
+        if filtered_posts:
+            print("   👥 Fetching subscriber count...")
+            free_subscriber_count = get_free_subscriber_count(newsletter_url)
+            print(f"   👥 Free subscribers: {free_subscriber_count}")
+            for post_info in filtered_posts:
+                post_info['free_subscriber_count'] = free_subscriber_count
+                post_info['likes_per_100_free_subscribers'] = calculate_engagement_rate(post_info['likes'], free_subscriber_count)
+
+        if max_posts and len(filtered_posts) > max_posts:
+            print(f"   ⚠️  {len(filtered_posts)} posts in window, keeping the newest {max_posts} (--max-posts)")
+            filtered_posts = filtered_posts[:max_posts]
+
         return filtered_posts
         
     except Exception as e:
         print(f"❌ Error processing newsletter {newsletter_url}: {e}")
-        return []
+        raise
 
 
-def calculate_engagement_rate(likes: str, free_subscriber_count: str) -> float:
-    
-    if likes == 'UNKNOWN':
-        return 'UNKNOWN'
-
-    if free_subscriber_count == 'UNKNOWN':
-        return 'UNKNOWN'
-        
-    subscriber_count = free_subscriber_count.replace(',', '')
+def parse_subscriber_count(free_subscriber_count: str) -> Optional[float]:
+    """Turn '1,234', '3K+' or '1M+' into a number (bottom of the band); None if unparseable."""
+    text = str(free_subscriber_count or '').replace(',', '').rstrip('+').strip()
+    multiplier = 1
+    if text[-1:].upper() in ('K', 'M'):
+        multiplier = 1_000 if text[-1].upper() == 'K' else 1_000_000
+        text = text[:-1]
     try:
-        subscriber_num = float(subscriber_count)
-    except (ValueError, TypeError):
-        raise ValueError(f"Invalid subscriber count: {subscriber_count}")
-        
+        return float(text) * multiplier
+    except ValueError:
+        return None
+
+
+def calculate_engagement_rate(likes: Any, free_subscriber_count: str) -> Any:
+    """Likes per 100 free subscribers, or 'UNKNOWN' if either number is missing."""
+    subscriber_num = parse_subscriber_count(free_subscriber_count)
+    if not isinstance(likes, (int, float)) or not subscriber_num:
+        return 'UNKNOWN'
     return round(100 * (likes / subscriber_num), 2)
 
 
@@ -397,35 +439,34 @@ def save_posts_to_csv(posts: List[Dict], output_file: str):
         'word_count', 'is_paid', 'post_id'
     ]
     
-    # Write posts to CSV file (or create empty file with headers)
-    with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        
-        writer.writeheader()
-        if posts:
-            for post in tqdm(posts, desc="Writing CSV", unit="row"):
+    # Write to a temp file and rename into place, so a crash mid-write never leaves a
+    # truncated CSV that resume would mistake for a finished newsletter
+    tmp_file = f"{output_file}.tmp.{os.getpid()}.{threading.get_ident()}"
+    try:
+        with open(tmp_file, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            for post in posts:
                 writer.writerow(post)
-    
+            csvfile.flush()
+            os.fsync(csvfile.fileno())
+        os.replace(tmp_file, output_file)
+    finally:
+        if os.path.exists(tmp_file):
+            os.remove(tmp_file)
+
     print(f"✅ Successfully saved {len(posts)} posts to: {output_file}")
 
 
-def check_existing_newsletter_file(url: str) -> Optional[str]:
-    """Check if a CSV file already exists for this newsletter and return the filename if it does."""
-    # Generate the expected filename for this newsletter
-    newsletter_name = extract_newsletter_name_from_url(url)
-    newsletter_name_safe = sanitize_filename(newsletter_name)
-    
-    # Check for individual newsletter file in substacks directory
-    expected_filename = os.path.join('substacks', f"{newsletter_name_safe}.csv")
-    
-    # Also check the original filename (in case it's a single newsletter run)
-    possible_files = [expected_filename]
-    
-    for filename in possible_files:
-        if os.path.exists(filename):  # Now accepts empty files too (size >= 0)
-            return filename
-    
-    return None
+def newsletter_csv_path(url: str, window_dir: str) -> str:
+    """Per-newsletter CSV path inside the folder for this run's date window."""
+    return os.path.join(window_dir, f"{sanitize_filename(extract_newsletter_name_from_url(url))}.csv")
+
+
+def check_existing_newsletter_file(url: str, window_dir: str) -> Optional[str]:
+    """Return this newsletter's CSV for the same date window if it exists (empty files count as done)."""
+    path = newsletter_csv_path(url, window_dir)
+    return path if os.path.exists(path) else None
 
 
 def load_existing_posts_from_csv(csv_file: str) -> List[Dict]:
@@ -494,7 +535,20 @@ def get_newsletters_from_profile(profile_url: str) -> List[str]:
         response.raise_for_status()
         
         content = response.text
-                
+
+        # Current format: preloads JSON lives in <script id="preloads-json" type="application/json">
+        json_tag = re.search(r'<script[^>]*id="preloads-json"[^>]*>(.*?)</script>', content, re.DOTALL)
+        if json_tag:
+            try:
+                data = json.loads(json_tag.group(1))
+                if isinstance(data, str):
+                    data = json.loads(data)
+                return _extract_newsletter_urls(data)
+            except json.JSONDecodeError as e:
+                print(f"   ❌ Failed to parse profile JSON: {e}")
+                return []
+
+        # Legacy format: window._preloads = JSON.parse("...")
         # More flexible regex to handle various whitespace patterns and escaped quotes
         # The JSON string can contain escaped quotes and span multiple lines
         preloads_match = re.search(r'window\._preloads\s*=\s*JSON\.parse\s*\(\s*"((?:[^"\\]|\\.)*)"\s*\)', content, re.DOTALL)
@@ -517,41 +571,38 @@ def get_newsletters_from_profile(profile_url: str) -> List[str]:
         except json.JSONDecodeError as e:
             print(f"   ❌ Failed to parse profile JSON: {e}")
             return []
-        
-        # Extract newsletter URLs from subscriptions
-        newsletter_urls = []
-        profile_data = data.get('profile', {})
-        
-        subscriptions = profile_data.get('subscriptions', [])
-        
-        if not subscriptions:
-            print("   ⚠️  No subscriptions found in profile")
-            return []
-        
-        for subscription in subscriptions:
-            publication = subscription.get('publication', {})
-            if publication:
-                subdomain = publication.get('subdomain')
-                custom_domain = publication.get('custom_domain')
-                
-                if custom_domain:
-                    url = f"https://{custom_domain}"
-                elif subdomain:
-                    url = f"https://{subdomain}.substack.com"
-                else:
-                    continue
-                
-                newsletter_urls.append(url)
-        
-        print(f"   ✅ Found {len(newsletter_urls)} newsletter(s)")
-        return newsletter_urls
-        
+
+        return _extract_newsletter_urls(data)
+
     except requests.RequestException as e:
         print(f"   ❌ Error fetching profile page: {e}")
         return []
     except Exception as e:
         print(f"   ❌ Unexpected error parsing profile: {e}")
         return []
+
+
+def _extract_newsletter_urls(data: dict) -> List[str]:
+    """Pull newsletter URLs from a profile page's preloads data."""
+    subscriptions = data.get('profile', {}).get('subscriptions', [])
+    if not subscriptions:
+        print("   ⚠️  No subscriptions found in profile")
+        return []
+
+    newsletter_urls = []
+    for subscription in subscriptions:
+        publication = subscription.get('publication', {})
+        if not publication:
+            continue
+        custom_domain = publication.get('custom_domain')
+        subdomain = publication.get('subdomain')
+        if custom_domain:
+            newsletter_urls.append(f"https://{custom_domain}")
+        elif subdomain:
+            newsletter_urls.append(f"https://{subdomain}.substack.com")
+
+    print(f"   ✅ Found {len(newsletter_urls)} newsletter(s)")
+    return newsletter_urls
 
 
 def main():
@@ -567,7 +618,8 @@ Examples:
   
 Resume functionality:
   If the script fails halfway through, simply run the same command again.
-  It will automatically skip newsletters that have already been scraped.
+  It will skip newsletters already scraped for the same --from/--to window
+  (per-newsletter files live in substacks/<from>_to_<to>/).
         """
     )
     
@@ -581,13 +633,15 @@ Resume functionality:
     parser.add_argument('--from', type=str, required=True, dest='from_date',
                        help='Start date for time window (YYYY-MM-DD)')
     parser.add_argument('--to', type=str, required=True, dest='to_date',
-                       help='End date for time window (YYYY-MM-DD)')
+                       help='End of time window: a date (YYYY-MM-DD) includes that whole day; a date and time is an exact cut-off')
     
     # Optional arguments
     parser.add_argument('--output', type=str, default='posts.csv', 
                        help='Output file name (default: posts.csv)')
     parser.add_argument('--max-posts', type=int, default=None,
-                       help='Maximum number of posts per newsletter')
+                       help='Keep at most this many (newest) posts per newsletter (default: no limit)')
+    parser.add_argument('--workers', type=int, default=DEFAULT_WORKERS,
+                       help=f'Newsletters to fetch in parallel (default: {DEFAULT_WORKERS})')
     parser.add_argument('--force-rescrape', action='store_true',
                        help='Force re-scraping of all newsletters, even if CSV files exist')
     
@@ -597,6 +651,11 @@ Resume functionality:
     try:
         from_date = parse_datetime(args.from_date, raise_on_error=True)
         to_date = parse_datetime(args.to_date, raise_on_error=True)
+        # A bare date means "through the end of that day"; a time is an exact (inclusive) cut-off
+        if ':' in args.to_date:
+            to_date_exclusive = to_date + timedelta(seconds=1)
+        else:
+            to_date_exclusive = to_date + timedelta(days=1)
         
         # Validate date range
         if from_date >= to_date:
@@ -605,12 +664,6 @@ Resume functionality:
     except ValueError as e:
         print(f"❌ {e}")
         return
-    
-    # Calculate default max posts based on days in the time window
-    if args.max_posts is None:
-        default_max_posts = calculate_default_max_posts(from_date, to_date)
-        print(f"📊 Default max posts set to {default_max_posts} (1 per day since {from_date.strftime('%Y-%m-%d')})")
-        args.max_posts = default_max_posts
     
     # Get list of URLs
     if args.url:
@@ -628,77 +681,83 @@ Resume functionality:
             return
     
     print(f"🔗 Processing {len(urls)} newsletter(s)...")
+
+    # Each date window gets its own folder, so resume never reuses results from a different window
+    window_dir = os.path.join('substacks', sanitize_filename(f"{args.from_date}_to_{args.to_date}"))
+    if len(urls) > 1:
+        print(f"📁 Per-newsletter files: {window_dir}/")
     
-    # Track all posts for final summary
-    all_posts = []
-    
-    # Track skipped and processed newsletters
-    skipped_newsletters = []
-    processed_newsletters = []
-    
-    # Process each newsletter individually
-    for i, url_data in enumerate(urls, 1):
+    def process_newsletter(i: int, url_data: Dict[str, str]):
+        """Returns (status, posts) where status is 'skipped', 'processed' or 'failed'."""
         url = url_data['url']
         category = url_data['category']
         category_display = f" ({category})" if category else ""
         print(f"\n📰 Processing newsletter {i}/{len(urls)}: {url}{category_display}")
-        
+
         # Check if this newsletter was already scraped (unless force-rescrape is enabled)
         if not args.force_rescrape:
-            existing_file = check_existing_newsletter_file(url)
+            existing_file = check_existing_newsletter_file(url, window_dir)
             if existing_file:
                 print(f"   ✅ Found existing file: {existing_file}")
                 print(f"   ⏭️  Skipping this newsletter (use --force-rescrape to override)")
-                
-                # Load existing data
                 existing_posts = load_existing_posts_from_csv(existing_file)
-                
                 # Update category in existing posts if it wasn't set before
                 for post in existing_posts:
                     if not post.get('category') and category:
                         post['category'] = category
-                
-                # Add to collections regardless of whether there are posts (empty files are valid)
-                all_posts.extend(existing_posts)
-                skipped_newsletters.append(url)
-                continue
-        
+                return 'skipped', existing_posts
+
         try:
-            posts = fetch_newsletter_posts(url, from_date, to_date, args.max_posts, category)
-            
-            if not posts:
-                print(f"   📝 No posts found for this newsletter - creating empty file to mark as processed")
-            else:
-                print(f"   ✅ Found {len(posts)} posts")
-                            
-            # Add to total collection (even if empty, for tracking)
-            all_posts.extend(posts)
-            processed_newsletters.append(url)
-            
-            # Save CSV immediately after processing this newsletter
-            print(f"   💾 Saving results for this newsletter...")
-            
-            # Create output filename with newsletter name
-            if len(urls) > 1:
-                # For multiple newsletters, create individual files using newsletter name
-                newsletter_name = extract_newsletter_name_from_url(url)
-                newsletter_name_safe = sanitize_filename(newsletter_name)
-                
-                # Create filename in substacks directory
-                individual_output = os.path.join('substacks', f"{newsletter_name_safe}.csv")
-            else:
-                # For single newsletter, use original filename in root directory
-                individual_output = args.output
-            
-            save_posts_to_csv(posts, individual_output)
-            
-            print(f"   ✅ Saved {len(posts)} posts to: {individual_output}")
-        
+            posts = fetch_newsletter_posts(url, from_date, to_date_exclusive, args.max_posts, category)
         except Exception as e:
             print(f"   ❌ Error processing newsletter {url}: {e}")
             print(f"   🔄 You can resume by running the same command again - completed newsletters will be skipped")
-            continue
-    
+            return 'failed', []
+
+        if not posts:
+            print(f"   📝 No posts found for this newsletter - creating empty file to mark as processed")
+        else:
+            print(f"   ✅ Found {len(posts)} posts")
+
+        if len(urls) > 1:
+            individual_output = newsletter_csv_path(url, window_dir)
+        else:
+            individual_output = args.output
+
+        save_posts_to_csv(posts, individual_output)
+        print(f"   ✅ Saved {len(posts)} posts to: {individual_output}")
+        return 'processed', posts
+
+    def run_buffered(i, url_data):
+        log.start_buffer()
+        try:
+            return process_newsletter(i, url_data)
+        finally:
+            log.end_buffer()
+
+    log = ThreadBufferedStdout(sys.stdout)
+    sys.stdout = log
+    results: Dict[int, Any] = {}
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+            futures = {pool.submit(run_buffered, i, url_data): i for i, url_data in enumerate(urls, 1)}
+            for done_count, future in enumerate(as_completed(futures), 1):
+                results[futures[future]] = future.result()
+                print(f"   ⏳ {done_count}/{len(urls)} newsletters done")
+    finally:
+        sys.stdout = log.real
+
+    # Keep the combined output in input order regardless of completion order
+    all_posts = []
+    skipped_newsletters = []
+    processed_newsletters = []
+    failed_newsletters = []
+    for i, url_data in enumerate(urls, 1):
+        status, posts = results[i]
+        all_posts.extend(posts)
+        {'skipped': skipped_newsletters, 'processed': processed_newsletters,
+         'failed': failed_newsletters}[status].append(url_data['url'])
+
     # Save combined results if processing multiple newsletters
     if len(urls) > 1:
         print(f"\n💾 Saving combined results from all {len(urls)} newsletters...")
@@ -715,6 +774,10 @@ Resume functionality:
         print(f"📊 Newly processed newsletters: {len(processed_newsletters)}")
     if skipped_newsletters:
         print(f"⏭️  Skipped newsletters (already existed): {len(skipped_newsletters)}")
+    if failed_newsletters:
+        print(f"❌ Failed newsletters (re-run to retry): {len(failed_newsletters)}")
+        for url in failed_newsletters:
+            print(f"   - {url}")
     
     print(f"📊 Individual newsletter files saved after each processing step")
     if len(urls) > 1:
